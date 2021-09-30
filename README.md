@@ -2,7 +2,7 @@
 
 ![labelling.png](labelling.png)
 
-Semantically annotated traffic lights for the [Cityscapes dataset](https://www.cityscapes-dataset.com/). The full dataset will be made available shortly after a final review is complete, in the meantime enjoy the labels for Dusseldorf.
+Semantically annotated traffic lights for the [Cityscapes dataset](https://www.cityscapes-dataset.com/). 
 
 ## Usage
 
