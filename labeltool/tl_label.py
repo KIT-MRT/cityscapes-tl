@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
 import sys
-from PySide6.QtCore import QStandardPaths, Qt, Slot, QPoint, QRect, QSize, QLine
+from PySide6.QtCore import QStandardPaths, Qt, Slot, QPoint, QRect, QSize, QLine, QObject, QEvent
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QScreen, QPixmap, QPainter, QPen, QColor, QBrush, QPolygon, QFont
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog,
-                               QMainWindow, QSlider, QStyle, QToolBar, QHBoxLayout, QVBoxLayout, QGridLayout, QWidget, QLabel, QComboBox, QGroupBox, QCheckBox, QLayout, QScrollArea, QRadioButton, QPushButton, QStatusBar, QSpinBox)
+                               QMainWindow, QSlider, QStyle, QToolBar, QHBoxLayout, QVBoxLayout, QGridLayout, QWidget, QLabel, QComboBox, QGroupBox, QCheckBox, QLayout, QScrollArea, QRadioButton, QPushButton, QStatusBar, QSpinBox, QTabWidget)
 from PySide6.QtMultimedia import (QAudio, QAudioOutput, QMediaFormat,
                                   QMediaPlayer)
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -18,9 +18,17 @@ from pathlib import Path
 import json
 import re
 import functools
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, MultiPolygon
 import copy
 import math
+import pyqtgraph as pg
+import numpy as np
+from configparser import ConfigParser
+import os
+import argparse
+import xdg
+
+#from .depth import getDepths
 
 CS_DIR = "/mrtstorage/datasets/public/cityscapes"
 VID_DIR = "/data/cityscapes_videos"
@@ -41,6 +49,38 @@ STATE_DICT = {"R": "red", "RY": "red-yellow", "Y" : "yellow", "G": "green", "O":
 COLOR_DICT = {"R": "salmon", "RY": "orange", "Y": "yellow", "G": "lightgreen", "O": "grey", "U": "lightgrey"}
 TYPE_DICT = {"Car": "car", "Ped": "pedestrian", "Bike": "bicycle", "Train": "train", "Bus": "bus", "CW": "car_warning", "Unk": "unknown"}
 Q_COLOR_DICT = {"red": Qt.red, "red-yellow": Qt.magenta, "yellow": Qt.yellow, "green": Qt.green, "off": Qt.black, "unknown": Qt.gray}
+
+VIZ_DEPTH_TEXT = "Color Depth"
+VIZ_TYPE_TEXT = "Color Attributes"
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--config', type=str)  # optional flag
+    parsed_args, unparsed_args = parser.parse_known_args()
+    return parsed_args, unparsed_args
+
+def get_conf(args):
+    if args.config:
+        return args.config
+    candidates = []
+    if xdg.BaseDirectory.xdg_config_dirs:
+        for d in xdg.BaseDirectory.xdg_config_dirs:
+            candidate_conf = os.path.join(d, "tl_label.conf")
+            if os.path.exists(candidate_conf):
+                return candidate_conf
+            else:
+                candidates.append(candidate_conf)
+    raise RuntimeError("Config not specified and not available in " + candidates)
+
+def parse_conf(conf_file):
+    config = ConfigParser()
+    config.read(conf_file)
+    c = {
+        "cs_dir": config.get("dirs", "cs_dir"),
+        "vid_dir": config.get("dirs", "vid_dir"),
+        "tl_dir": config.get("dirs", "tl_dir")
+    }
+    return c
 
 def split_fn(fn):
     split, city, img = fn.split("/")
@@ -66,6 +106,8 @@ def ensure_dir(d):
 def buffer(poly, buffer):
     p = Polygon(poly)
     dilated = p.buffer(buffer)
+    if isinstance(dilated, MultiPolygon):
+        dilated = dilated.convex_hull
     x,y = dilated.exterior.coords.xy
     res = zip(x,y)
     return res
@@ -89,44 +131,28 @@ def get_color(attrs, alpha=180):
     color.setAlpha(alpha)
     return color
 
+def get_color_depth(tl, alpha=180):
+    idx = tl["attributes"]["depth"]
+    colors = [Qt.white, Qt.cyan, Qt.green, Qt.red, Qt.yellow]
+    color = QColor(colors[idx])
+    color.setAlpha(alpha)
+    return color
+
 def to_truth_vec(names, keys):
     return [True if n in keys else False for n in names]
 
 def get_centroid(poly):
     return Polygon(poly).centroid.coords[:][0]
 
-class DepthHolder():
-    def __init__(self, depth_file):
-        self._depths = {}
-        cur_img = ""
-        to_skip = len(DEPTH_PREFIX + "/gtFine/")
-        with open(depth_file, "r") as f:
-            for line in f.readlines():
-                fn, cls, x1, x2, y1, y2, depth, idx = line.split()
-
-                fn = fn[to_skip:]
-                #print(fn)
-                key = fn[:-len(LABEL_ENDING)]
-                idx = int(idx)
-                if key != cur_img:
-                    self._depths[key] = {}
-                    cur_img = key
-                if cls != TL_CLS:
-                    continue
-                self._depths[key][idx] = float(depth) if math.isfinite(float(depth)) else 0
-        print(self._depths.keys())
-
-    def get_depth(self, city, idx):
-        return self._depths[city][idx]
-
-    def get_key(self, key):
-        return self._depths[key]
+def to_bbox(poly):
+    x, y = zip(*poly)
+    return (min(x), min(y)), (max(x), max(y))
 
 class LabelIO():
-    def __init__(self, file, depth_data):
+    def __init__(self, file):
         self._file = file
         self._state = None
-        self._depth_data = depth_data
+        # self._depth_data = depth_data
         if not os.path.exists(file):
             raise RuntimeError("Could not find " + file)
         with open(file, "r") as f:
@@ -274,17 +300,29 @@ class DataLoader():
     def get_depth(self):
         return DEPTH_FILE
 
+class EventFilter(QObject):
+    def __init__(self, main_window, tl_idx):
+        super().__init__()
+        self.main_window = main_window
+        self.tl_idx = tl_idx
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Enter:  # Catch the TouchBegin event.
+            self.main_window.set_tl_filter(self.tl_idx)
+            return True
+        elif event.type() == QEvent.Leave:  # Catch the TouchEnd event.
+            self.main_window.remove_tl_filter()
+            return True
+
+        return super().eventFilter(obj, event)
 
 class MainWindow(QMainWindow):
 
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
         print("discovering")
-        self._data = DataLoader()
+        self._data = DataLoader(cs_dir=config["cs_dir"], vid_dir=config["vid_dir"], tl_dir=config["tl_dir"])
         print("finished loading")
-        print("Reading depths")
-        self._depths = DepthHolder(self._data.get_depth())
-        print("Finished")
         self._playlist = []  # FIXME 6.3: Replace by QMediaPlaylist?
         self._playlist_index = -1
         self._player = QMediaPlayer()
@@ -294,6 +332,8 @@ class MainWindow(QMainWindow):
         self._label_io = None
         self._draw_stuff = None
         self._redraw_lock = False
+        self._tl_filter = None
+        self._tl_draw_style = "type"
 
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
@@ -337,18 +377,22 @@ class MainWindow(QMainWindow):
         #self._crop_scroll.setFixedHeight(500)
         #self._crop_layout.setSpacing(10)
         self._crops = []
+        self.mouseover_filters = []
         self._layout1.addWidget(self._crop_scroll)
 
+        self._tab_widget = QTabWidget()
         self._video_widget = QVideoWidget()
         self._video_widget.setFixedWidth(2048)
+        self._tab_widget.addTab(self._video_widget, "Video")
 
-        self._layout1.addWidget(self._video_widget)
+        self._layout1.addWidget(self._tab_widget)
         self.setCentralWidget(self._main_widget)
         self._player.setVideoOutput(self._video_widget)
+        self._tab_widget.tabBarClicked.connect(self.tab_changed)
 
         profile = QWebEngineProfile.defaultProfile()
         profile.setCachePath("/tmp/qcache")
-        profile.setPersistentStoragePath("/home/janosovits/.qstorage")
+        profile.setPersistentStoragePath("~/.qstorage")
         profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
         self._web_widget = QWebEngineView()
         self._web_widget.setFixedWidth(500)
@@ -398,6 +442,8 @@ class MainWindow(QMainWindow):
 
         reload = tool_bar.addAction("Reload")
         reload.triggered.connect(self.on_reload)
+        self._viz_depth_action = tool_bar.addAction(VIZ_DEPTH_TEXT)
+        self._viz_depth_action.triggered.connect(self.on_viz_depth)
 
     def _make_crop_widget(self, tl, tl_idx):
         main = QWidget()
@@ -419,6 +465,9 @@ class MainWindow(QMainWindow):
         mmin, mmax = pad_box(to_bbox(tl["polygon"]), 10, IMG_SZ)
         crop = self._pixmap_clean.copy(QRect(mmin[0], mmin[1], mmax[0] - mmin[0], mmax[1] - mmin[1])).scaled(QSize(100, 200), Qt.KeepAspectRatio)
         label.setPixmap(crop)
+        fil = EventFilter(self, tl_idx)
+        self.mouseover_filters.append(fil)
+        label.installEventFilter(fil)
         name = QLabel()
         name.setText(str(tl_idx))
         name.setStyleSheet("font-weight: bold")
@@ -434,9 +483,6 @@ class MainWindow(QMainWindow):
         vlayout.addWidget(state_button_widget)
         vlayout.addLayout(hlayout_bottom)
         hlayout_bottom.addWidget(main.spinner)
-        depth_metric = QLabel()
-        depth_metric.setText("{:.2f}".format(tl["depth_metric"]))
-        hlayout_bottom.addWidget(depth_metric)
         main.del_button = QPushButton("Delete")
         main.del_button.clicked.connect(functools.partial(self.on_delete, tl_idx))
         hlayout_top.addWidget(main.del_button)
@@ -481,6 +527,8 @@ class MainWindow(QMainWindow):
             widget.deleteLater()
         del self._crops
         self._crops = []
+        self.mouseover_filters.clear()
+        self._tl_filter = None
 
     def _update_crops(self, tls):
         self._clear_crops()
@@ -514,9 +562,12 @@ class MainWindow(QMainWindow):
         font.setPixelSize(25)
         qp.setFont(font)
         for idx, tl in tls.items():
-            print(tl["depth_metric"])
+            print(self._tl_filter)
+            if self._tl_filter is not None and idx != self._tl_filter:
+                continue
             qp.setBrush(Qt.NoBrush)
-            qp.setPen(QPen(get_color(tl["attributes"]), 5))
+            draw_color = get_color(tl["attributes"]) if self._tl_draw_style == "type" else get_color_depth(tl)
+            qp.setPen(QPen(draw_color, 5))
             poly = to_qpolygon(buffer(tl["polygon"], 5))
             qp.drawPolygon(poly)
             box = pad_box(to_bbox(tl["polygon"]), 10, IMG_SZ)
@@ -542,6 +593,7 @@ class MainWindow(QMainWindow):
         if not self._redraw_lock:
             self._pixmap = self._pixmap_clean.copy()
             self._draw_tls(self._tls)
+            # self._update_plot(self._tls)
             self._img_widget.setPixmap(self._pixmap)
 
     def _update_light_state(self):
@@ -549,8 +601,8 @@ class MainWindow(QMainWindow):
         self._redraw()
 
     def _labels_changed(self):
-        depths = self._depths.get_key(self._data._get_stem())
-        self._label_io = LabelIO(self._data.get_tls(), depths)
+        # depths = self._depths.get_key(self._data._get_stem())
+        self._label_io = LabelIO(self._data.get_tls())
         self._tls = self._label_io.get_lights()
         self._update_crops(self._tls)
         self._redraw()
@@ -599,6 +651,23 @@ class MainWindow(QMainWindow):
             icon = QIcon.fromTheme("media-playback-stop.png", style.standardIcon(QStyle.SP_MediaStop))
             self._stop_action.setIcon(icon)
 
+    def _change_viz_depth(self):
+        if self._viz_depth_action.text() == VIZ_DEPTH_TEXT:
+            self._viz_depth_action.setText(VIZ_TYPE_TEXT)
+            self._tl_draw_style = "depth"
+        else:
+            self._viz_depth_action.setText(VIZ_DEPTH_TEXT)
+            self._tl_draw_style = "type"
+        self._redraw()
+
+    def set_tl_filter(self, idx):
+        self._tl_filter = idx
+        self._redraw()
+
+    def remove_tl_filter(self):
+        self._tl_filter = None
+        self._redraw()
+
     def _get_gnss(self):
         with open(self._data.get_vehicle(), "r") as f:
             root = json.load(f)
@@ -640,6 +709,18 @@ class MainWindow(QMainWindow):
     @Slot()
     def toggle_play(self):
         self._toggle_play()
+
+    @Slot()
+    def tab_changed(self, foo):
+        if foo != 0:
+            return
+        self._video_widget.deleteLater()
+        self._tab_widget.removeTab(0)
+        self._video_widget = QVideoWidget()
+        self._video_widget.setFixedWidth(2048)
+        self._update_video()
+        self._player.setVideoOutput(self._video_widget)
+        self._tab_widget.insertTab(0, self._video_widget, "Video")
 
     @Slot()
     def on_type(self, tl_idx, new_type, checked):
@@ -687,9 +768,18 @@ class MainWindow(QMainWindow):
     def on_reload(self):
         self._labels_changed()
 
+    @Slot()
+    def on_viz_depth(self):
+        self._change_viz_depth()
+
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    main_win = MainWindow()
+    parsed_args, unparsed_args = parse_args()
+    # QApplication expects the first argument to be the program name.
+    qt_args = sys.argv[:1] + unparsed_args
+    print(parsed_args)
+    app = QApplication(qt_args)
+    conf = parse_conf(get_conf(parsed_args))
+    main_win = MainWindow(conf)
     available_geometry = main_win.screen().availableGeometry()
     #main_win.resize(available_geometry.width() - 50,
     #                available_geometry.height() - 100)
